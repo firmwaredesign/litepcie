@@ -62,6 +62,7 @@
 /* Lattice */
 
 #define PCIE_LATTICE_DEVICE_ID_CPNX_GEN3_X4 0x9c25
+#define PCIE_LATTICE_DEVICE_ID_LFD2NX_GEN1_X1 0x9c26
 
 /* Gowin */
 
