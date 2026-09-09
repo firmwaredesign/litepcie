@@ -26,6 +26,7 @@ Current version of the generator is limited to:
 - Altera Cyclone V.
 - Gowin GW5AT.
 - Lattice LFCPNX.
+- Lattice LFD2NX.
 """
 
 import yaml
@@ -47,6 +48,7 @@ from litex.soc.integration.builder  import *
 
 from litepcie.phy.c5pciephy     import C5PCIEPHY
 from litepcie.phy.lfcpnxpciephy import LFCPNXPCIEPHY
+from litepcie.phy.lfd2nxpciephy import LFD2NXPCIEPHY
 from litepcie.phy.gw5apciephy   import GW5APCIEPHY
 from litepcie.phy.s7pciephy     import S7PCIEPHY
 from litepcie.phy.uspciephy     import USPCIEPHY
@@ -112,6 +114,31 @@ def get_clkin125_ios():
     # LFCPNXPCIEPHY's LMMI/config logic needs a separate 125MHz reference Clk,
     # provided by the User (independent of the PCIe refclk).
     return [("clkin125", 0, Pins(1))]
+
+def get_pcie_ios_lattice_lfd2nx():
+    # LFD2NXPCIEPHY's "pci" IP is only ever generated single-lane, so unlike
+    # get_pcie_ios_lattice_lfcpnx() every signal here (including refret/rext) is
+    # fixed scalar width -- there's no phy_lanes to parametrize on.
+    return [
+        ("pcie", 0,
+            Subsignal("rst_n",  Pins(1)),
+            Subsignal("clk_p",  Pins(1)),
+            Subsignal("clk_n",  Pins(1)),
+            Subsignal("rx_p",   Pins(1)),
+            Subsignal("rx_n",   Pins(1)),
+            Subsignal("tx_p",   Pins(1)),
+            Subsignal("tx_n",   Pins(1)),
+            Subsignal("perst",  Pins(1)),
+            Subsignal("refret", Pins(1)),
+            Subsignal("rext",   Pins(1)),
+        ),
+    ]
+
+def get_clkin_usr_ios():
+    # LFD2NXPCIEPHY needs a separate User-provided Clk on clk_usr_i (independent
+    # of the PCIe refclk); minimum frequency depends on the target link speed
+    # baked into the generated archive -- see litepcie/phy/lfd2nxpciephy.py.
+    return [("clkin_usr", 0, Pins(1))]
 
 def get_axi_dma_ios(_id, data_width, with_writer=True, with_reader=True):
     ios = []
@@ -208,11 +235,14 @@ class LitePCIeCore(SoCMini):
         "ptm_requester"    : 6,
     }
     def __init__(self, platform, core_config):
-        # LFCPNXPCIEPHY needs extra PCIe pads (perst/refret/rext) and a separate
-        # clkin125 reference Clk that the generic PCIe IOs don't provide.
+        # LFCPNXPCIEPHY/LFD2NXPCIEPHY need extra PCIe pads (perst/refret/rext) and a
+        # separate User Clk that the generic PCIe IOs don't provide.
         if core_config["phy"] is LFCPNXPCIEPHY:
             platform.add_extension(get_pcie_ios_lattice_lfcpnx(core_config["phy_lanes"]))
             platform.add_extension(get_clkin125_ios())
+        elif core_config["phy"] is LFD2NXPCIEPHY:
+            platform.add_extension(get_pcie_ios_lattice_lfd2nx())
+            platform.add_extension(get_clkin_usr_ios())
         else:
             platform.add_extension(get_pcie_ios(core_config["phy_lanes"]))
         platform.add_extension(get_msi_irqs_ios(width=core_config["msi_irqs"]))
@@ -566,6 +596,17 @@ def main():
             "LFCPNXPCIEPHY only supports phy_lanes: 1 or 4 (Lattice's PCIe hard IP is generated per lane count)."
         core_config.setdefault("phy_pcie_data_width", {1: 32, 4: 128}[phy_lanes])
         core_config["phy"] = LFCPNXPCIEPHY
+    elif core_config["phy"] == "LFD2NXPCIEPHY":
+        from litex.build.lattice import LatticePlatform
+        platform = LatticePlatform(core_config["phy_device"], io=[], toolchain="radiant")
+        # This IP is baked with MSI enabled/MSI-X disabled at generation time (see
+        # litepcie/phy/lfd2nxpciephy.py); default the LitePCIe-side MSI mechanism to match.
+        core_config.setdefault("msi_x", False)
+        # Only ever generated single-lane -- no lane count to select an archive by.
+        assert core_config.get("phy_lanes", 1) == 1, \
+            "LFD2NXPCIEPHY only supports phy_lanes: 1 (this IP is generated single-lane only)."
+        core_config.setdefault("phy_pcie_data_width", 32)
+        core_config["phy"] = LFD2NXPCIEPHY
     elif core_config["phy"] == "GW5APCIEPHY":
         from litex.build.gowin import GowinPlatform
         platform = GowinPlatform(core_config["phy_device"], io=[], toolchain="gowin")
