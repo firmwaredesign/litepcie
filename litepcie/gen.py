@@ -87,6 +87,32 @@ def get_pcie_ios(phy_lanes=4):
         ),
     ]
 
+def get_pcie_ios_lattice_lfcpnx(phy_lanes=4):
+    # LFCPNXPCIEPHY drives its hard IP directly from pads and needs a few extra
+    # signals on top of the generic PCIe IOs: perst (active-low PERST# from the
+    # connector), refret/rext (SerDes reference-resistor bias pins). refret/rext
+    # are always 4-bit: they're tied to the 4 physical lanes of the SerDes quad
+    # itself, regardless of how many are actually used for the PCIe link.
+    return [
+        ("pcie", 0,
+            Subsignal("rst_n",  Pins(1)),
+            Subsignal("clk_p",  Pins(1)),
+            Subsignal("clk_n",  Pins(1)),
+            Subsignal("rx_p",   Pins(phy_lanes)),
+            Subsignal("rx_n",   Pins(phy_lanes)),
+            Subsignal("tx_p",   Pins(phy_lanes)),
+            Subsignal("tx_n",   Pins(phy_lanes)),
+            Subsignal("perst",  Pins(1)),
+            Subsignal("refret", Pins(4)),
+            Subsignal("rext",   Pins(4)),
+        ),
+    ]
+
+def get_clkin125_ios():
+    # LFCPNXPCIEPHY's LMMI/config logic needs a separate 125MHz reference Clk,
+    # provided by the User (independent of the PCIe refclk).
+    return [("clkin125", 0, Pins(1))]
+
 def get_axi_dma_ios(_id, data_width, with_writer=True, with_reader=True):
     ios = []
 
@@ -182,7 +208,13 @@ class LitePCIeCore(SoCMini):
         "ptm_requester"    : 6,
     }
     def __init__(self, platform, core_config):
-        platform.add_extension(get_pcie_ios(core_config["phy_lanes"]))
+        # LFCPNXPCIEPHY needs extra PCIe pads (perst/refret/rext) and a separate
+        # clkin125 reference Clk that the generic PCIe IOs don't provide.
+        if core_config["phy"] is LFCPNXPCIEPHY:
+            platform.add_extension(get_pcie_ios_lattice_lfcpnx(core_config["phy_lanes"]))
+            platform.add_extension(get_clkin125_ios())
+        else:
+            platform.add_extension(get_pcie_ios(core_config["phy_lanes"]))
         platform.add_extension(get_msi_irqs_ios(width=core_config["msi_irqs"]))
         sys_clk_freq = float(core_config.get("clk_freq", 125e6))
 
@@ -524,8 +556,15 @@ def main():
     elif core_config["phy"] == "LFCPNXPCIEPHY":
         from litex.build.lattice import LatticePlatform
         platform = LatticePlatform(core_config["phy_device"], io=[], toolchain="radiant")
-        core_config.setdefault("phy_pcie_data_width", 128)
         core_config.setdefault("msi_x", True)
+        # Generated Lattice hard IP archives only exist for these lane counts (see
+        # LFCPNXPCIEPHY.ip_urls); fail early with a clear message instead of the
+        # assert inside LFCPNXPCIEPHY. pcie_data_width is fixed by the IP itself
+        # (32-bit/lane), so default it from phy_lanes rather than a flat constant.
+        phy_lanes = core_config.get("phy_lanes", 4)
+        assert phy_lanes in [1, 4], \
+            "LFCPNXPCIEPHY only supports phy_lanes: 1 or 4 (Lattice's PCIe hard IP is generated per lane count)."
+        core_config.setdefault("phy_pcie_data_width", {1: 32, 4: 128}[phy_lanes])
         core_config["phy"] = LFCPNXPCIEPHY
     elif core_config["phy"] == "GW5APCIEPHY":
         from litex.build.gowin import GowinPlatform

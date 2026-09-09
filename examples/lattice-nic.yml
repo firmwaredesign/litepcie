@@ -1,0 +1,50 @@
+#
+# This file is part of LitePCIe.
+#
+# Copyright (c) 2019-2024 Florent Kermarrec <florent@enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
+# Minimal NIC-style standalone core for Lattice CertusPro-NX/Crosslink-NX (LFCPNX):
+# single-lane PCIe endpoint + a single DMA channel, nothing else.
+#
+# NOTE: LFCPNXPCIEPHY wraps Lattice's PCIe hard IP (latticesemi.com_ip_pcie_x4_1.1.0
+# family), which is only generated per lane count -- "phy_lanes" must be 1 or 4 (see
+# LFCPNXPCIEPHY.ip_urls); other counts are rejected early by gen.py with a clear error.
+# phy_pcie_data_width is fixed by the IP itself (32-bit/lane: 32 for 1 lane, 128 for 4).
+
+{
+    # PHY ----------------------------------------------------------------------
+    "phy"                     : "LFCPNXPCIEPHY", # Type of PCIe PHY
+    "phy_device"              : "LFCPNX",        # Type of Device (CertusPro-NX)
+    "phy_lanes"               : 1,               # Number of lanes
+    "phy_pcie_data_width"     : 32,              # PCIe data_width (32 for 1 lane)
+    "phy_data_width"          : 64,              # Bus data_width
+    "phy_bar0_size"           : 0x40000,         # BAR0 size
+
+    # Clocking -----------------------------------------------------------------
+    "clk_freq"                : 125e6, # User Clk Freq (AXI MMAP/DMA)
+    "clk_external"            : False, # Use external User provided Clk
+
+    # Endpoint -----------------------------------------------------------------
+    "ep_max_pending_requests" : 8,
+    "ep_address_width"        : 32,
+
+    # Control ------------------------------------------------------------------
+    "ctrl"                    : False,
+
+    # MMAP Master --------------------------------------------------------------
+    "mmap"                    : False,
+
+    # MMAP Slave ---------------------------------------------------------------
+    "mmap_slave"              : False,
+
+    # DMA channels -------------------------------------------------------------
+    "dma_channels"            : 1,     # Number of DMA channels
+    "dma_buffering"           : 8192,  # Buffering for each channel (in bytes)
+    "dma_loopback"            : False, # Enable DMA loopback capability
+    "dma_synchronizer"        : False, # Enable DMA synchronizer capability
+    "dma_monitor"             : False, # Enable DMA monitoring capability
+
+    # MSI IRQs -----------------------------------------------------------------
+    "msi_irqs"                : 4, # Number or MSI IRQs
+}

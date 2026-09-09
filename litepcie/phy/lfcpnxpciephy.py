@@ -81,10 +81,15 @@ class LFCPNXPCIEPHY(LiteXModule):
 
         completer_id = Signal(16)
         nlanes = len(pads.tx_p)
+        self.nlanes = nlanes
 
+        # pcie_data_width is fixed by the generated hard IP: 32-bit/lane on the
+        # TLP interface (link0_tx_data_i/link0_rx_data_o), independent of the
+        # LitePCIe-side data_width (converted via PHYTXDatapath/PHYRXDatapath).
         assert data_width in [64, 128]
-        assert pcie_data_width == 128
-        assert nlanes in [4]
+        assert nlanes in [1, 4]
+        assert pcie_data_width == {1: 32, 4: 128}[nlanes], \
+            "pcie_data_width must be 32 for a 1-lane LFCPNXPCIEPHY core, 128 for a 4-lane one."
 
         self.comb += self.id.eq(completer_id)
 
@@ -363,10 +368,25 @@ class LFCPNXPCIEPHY(LiteXModule):
         )
 
     # Finalize -------------------------------------------------------------------------------------
+
+    # Radiant IPGen-generated IP archive per lane count (the hard IP is fixed at
+    # generation time: port widths, PCIE_BIFUR_SEL, etc. all depend on nlanes,
+    # so each variant is a separate archive).
+    ip_urls = {
+        4: "https://github.com/user-attachments/files/18943678/lfcpnxpciephy.zip",
+        1: "https://www.firmwaredesign.no/litepcie/lattice/lfcpnx-pcie-1x/lfcpnxpciephy.zip",
+    }
+
     def do_finalize(self):
-        src_dir = os.path.join(self.platform.output_dir, "lfcpnxpciephy")
-        src_zip = os.path.join(self.platform.output_dir, "lfcpnxpciephy.zip")
-        url     = "https://github.com/user-attachments/files/18943678/lfcpnxpciephy.zip"
+        assert self.nlanes in self.ip_urls, f"No lfcpnxpciephy IP archive available for phy_lanes={self.nlanes}."
+        url = self.ip_urls[self.nlanes]
+
+        # Cache/extract per lane count so switching phy_lanes with a shared
+        # --output-dir can't reuse another variant's stale extracted sources.
+        cache_name = f"lfcpnxpciephy_x{self.nlanes}"
+        cache_dir  = os.path.join(self.platform.output_dir, cache_name)
+        src_zip    = os.path.join(self.platform.output_dir, f"{cache_name}.zip")
+        src_dir    = os.path.join(cache_dir, "lfcpnxpciephy") # Zip's own top-level folder.
         if not os.path.exists(src_dir):
             # If zip archive is not available
             if not os.path.exists(src_zip):
@@ -384,8 +404,8 @@ class LFCPNXPCIEPHY(LiteXModule):
                     print("The 'wget' command is not available. Please install wget and try again.")
 
             # Extract archive.
-            # Build the wget command
-            command = ["unzip", src_zip, "-d" , self.platform.output_dir]
+            os.makedirs(cache_dir, exist_ok=True)
+            command = ["unzip", src_zip, "-d" , cache_dir]
             try:
                 print(f"Unzipping {src_zip}...")
                 # Execute the wget command
