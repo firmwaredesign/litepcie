@@ -25,6 +25,11 @@
 # into the archive at generation time (per the IP's own port comment: "Min. Clock input,
 # 62.5 MHz - Gen1, 125MHz - Gen2, 250MHz - Gen3"); the default archive in ip_urls below
 # was generated for a Gen1 (2.5GT/s) link, so >=62.5MHz on "clkin_usr" is required.
+#
+# The "pcie" domain and usr_lmmi_clk_i are clocked directly from clkin_usr, never from the IP's
+# clk_usr_o (left open): with usr_lmmi_clk_i fed back from clk_usr_o, the IP doesn't come up and
+# the device doesn't enumerate (seen on hardware). Lattice's reference design likewise clocks
+# LMMI from a free-running clock.
 
 import os
 import subprocess
@@ -83,9 +88,8 @@ class LFD2NXPCIEPHY(LiteXModule):
 
         # Clocking / Reset -------------------------------------------------------------------------
         clk_usr_i = platform.request("clkin_usr")
-        pcie_clk  = Signal()
         self.cd_pcie = ClockDomain()
-        self.comb += self.cd_pcie.clk.eq(pcie_clk)
+        self.comb += self.cd_pcie.clk.eq(clk_usr_i)
 
         # Link Status ------------------------------------------------------------------------------
         link_up    = Signal()
@@ -119,7 +123,10 @@ class LFD2NXPCIEPHY(LiteXModule):
             endianness = "big",
             mode       = "be",
         )
-        self.s_axis_tx = s_axis_tx = self.tx_datapath.source
+        # vc_tx_* has no byte enables: drop the padding DWORDs of odd-length TLPs.
+        self.tx_padding = tx_padding = ClockDomainsRenamer("pcie")(PHYTXPaddingRemover(pcie_data_width))
+        self.comb += self.tx_datapath.source.connect(tx_padding.sink)
+        self.s_axis_tx = s_axis_tx = tx_padding.source
 
         for i in range(pcie_data_width//8):
             self.comb += tx_data_p[i].eq(Reduce("XOR", self.s_axis_tx.dat[i*8:(i+1)*8]))
@@ -131,7 +138,10 @@ class LFD2NXPCIEPHY(LiteXModule):
             clock_domain    = cd,
         )
         rx_sop = Signal()
-        self.m_axis_rx = m_axis_rx = self.rx_datapath.sink
+        # vc_rx_* has no byte enables: pad odd-length TLPs with be == 0 DWORDs before up-conversion.
+        self.rx_padding = rx_padding = ClockDomainsRenamer("pcie")(PHYRXPaddingInserter(pcie_data_width, ratio=data_width//pcie_data_width))
+        self.comb += rx_padding.source.connect(self.rx_datapath.sink)
+        self.m_axis_rx = m_axis_rx = rx_padding.sink
         self.comb += [
             m_axis_rx.first.eq(rx_sop),
             m_axis_rx.be.eq(2**len(m_axis_rx.be) - 1),
@@ -174,7 +184,7 @@ class LFD2NXPCIEPHY(LiteXModule):
             # config-space parameters are baked in at IP-generation time (see module header).
             i_rst_usr_n_i                 = pads.perst,
             i_clk_usr_i                   = clk_usr_i,
-            o_clk_usr_o                   = pcie_clk,
+            o_clk_usr_o                   = Open(), # Not used as a clock: see module header.
             o_u_pl_link_up_o              = pl_link_up,
             o_u_dl_link_up_o              = dl_link_up,
             o_u_tl_link_up_o              = tl_link_up,
@@ -195,7 +205,7 @@ class LFD2NXPCIEPHY(LiteXModule):
 
             # LMMI (Configuration) -- unused, tied off: this IP bakes vendor/device ID, BAR
             # sizing and MSI capability into synthesis-time parameters instead. -----------------
-            i_usr_lmmi_clk_i              = ClockSignal("pcie"),
+            i_usr_lmmi_clk_i              = clk_usr_i, # Free-running: must run before the IP is up.
             i_usr_lmmi_resetn_i           = Constant(1, 1),
             i_usr_lmmi_request_i          = Constant(0, 1),
             i_usr_lmmi_wr_rdn_i           = Constant(1, 1),
