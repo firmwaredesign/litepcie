@@ -13,6 +13,8 @@ from shutil import which
 import subprocess
 
 from migen import *
+from migen.genlib.cdc import MultiReg
+from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex.gen import *
 
@@ -22,6 +24,59 @@ from litex.soc.interconnect.csr import *
 from litepcie.common import *
 from litepcie.tlp.common import *
 from litepcie.phy.common import *
+
+# LFCPNX UCFG ID Reader ----------------------------------------------------------------------------
+
+class LFCPNXUCFGIDReader(LiteXModule):
+    """Poll the endpoint's Bus/Device/Function (Requester/Completer ID) over UCFG.
+
+    The IP captures it from Type 0 Configuration Writes and provides it at UCFG address 0x5F
+    (PCIe x4 IP Core User Guide, "UCFG Address Space"). It changes at enumeration, so it is polled
+    once the Transaction Layer is up. (LMMI 0x04034 is the Root Port ID setting, not this ID.)
+    """
+    def __init__(self, poll_period=125000):
+        # Control.
+        self.tl_link_up = Signal()
+        self.id         = Signal(16)
+
+        # UCFG Interface.
+        self.valid   = Signal()
+        self.addr    = Constant(0x5f, 10) # ucfg_addr_i[11:2].
+        self.ready   = Signal()
+        self.rd_done = Signal()
+        self.rd_data = Signal(32)
+
+        # # #
+
+        poll_count = Signal(max=poll_period)
+        poll       = Signal()
+        self.comb += poll.eq(poll_count == 0)
+        self.sync += If(poll,
+            poll_count.eq(poll_period - 1)
+        ).Else(
+            poll_count.eq(poll_count - 1)
+        )
+
+        self.fsm = fsm = FSM(reset_state="IDLE")
+        fsm.act("IDLE",
+            If(poll & self.tl_link_up,
+                NextState("REQUEST")
+            )
+        )
+        fsm.act("REQUEST",
+            self.valid.eq(1),
+            If(self.ready,
+                NextState("WAIT")
+            )
+        )
+        fsm.act("WAIT",
+            If(self.rd_done,
+                NextValue(self.id, self.rd_data[:16]),
+                NextState("IDLE")
+            ).Elif(poll, # No response: retry on next poll.
+                NextState("IDLE")
+            )
+        )
 
 # LFCPNXPCIEPHY ------------------------------------------------------------------------------------
 
@@ -196,7 +251,7 @@ class LFCPNXPCIEPHY(LiteXModule):
 
         # Lattice's raw TLP wrapper exposes MSI-X capability registers, but the
         # generated IP defaults do not match LitePCIe's standalone CSR map.
-        lmmi_fixup_index  = Signal(max=4)
+        lmmi_fixup_index  = Signal(max=3)
         lmmi_fixup_active = Signal()
         lmmi_fixup_write  = Signal()
         lmmi_fixup_wdata  = Signal(32)
@@ -224,11 +279,6 @@ class LFCPNXPCIEPHY(LiteXModule):
                     lmmi_fixup_offset.eq(0x040f8 >> 2),
                     lmmi_fixup_wdata.eq(0x0000_1808),
                 ],
-                # Bus/Device/Function ID used as requester/completer ID.
-                3 : [
-                    lmmi_fixup_write.eq(0),
-                    lmmi_fixup_offset.eq(0x04034 >> 2),
-                ],
             })
         ]
         lmmi_fixup_state = Signal(2)
@@ -243,18 +293,37 @@ class LFCPNXPCIEPHY(LiteXModule):
                     0 : lmmi_fixup_state.eq(1),
                     1 : lmmi_fixup_state.eq(2),
                     2 : If(lmmi_fixup.ready[0],
-                        If(lmmi_fixup_write,
+                        If(lmmi_fixup_index == 2,
+                            lmmi_fixup_done.eq(1),
+                        ).Else(
                             lmmi_fixup_index.eq(lmmi_fixup_index + 1),
                             lmmi_fixup_state.eq(0),
-                        ).Else(
-                            lmmi_fixup_state.eq(3),
                         )
                     ),
-                    3 : If(lmmi_fixup.rdata_valid[0],
-                        completer_id.eq(lmmi_fixup.rdata[:16]),
-                        lmmi_fixup_done.eq(1),
-                    ),
                 })
+            )
+        ]
+
+        # Bus/Device/Function ID used as requester/completer ID ------------------------------------
+        # UCFG is in the IP's sys_clk_i domain.
+        self.cd_pcie_sys = ClockDomain()
+        self.comb += self.cd_pcie_sys.clk.eq(sys_clk)
+        self.specials += AsyncResetSynchronizer(self.cd_pcie_sys, ~pads.perst)
+
+        self.ucfg_id_reader = ucfg_id_reader = ClockDomainsRenamer("pcie_sys")(LFCPNXUCFGIDReader())
+        self.specials += MultiReg(link0_tl_link_up, ucfg_id_reader.tl_link_up, "pcie_sys")
+        ucfg_rd_done = Signal(2)
+        self.comb += ucfg_id_reader.rd_done.eq(ucfg_rd_done[0]) # [0]: Link 0.
+
+        # Resynchronize to "pcie"; only take a value seen on two consecutive cycles (bits of a
+        # changing value may be resynchronized on different cycles).
+        ucfg_id   = Signal(16)
+        ucfg_id_d = Signal(16)
+        self.specials += MultiReg(ucfg_id_reader.id, ucfg_id, "pcie")
+        self.sync.pcie += [
+            ucfg_id_d.eq(ucfg_id),
+            If(ucfg_id == ucfg_id_d,
+                completer_id.eq(ucfg_id)
             )
         ]
 
@@ -336,16 +405,17 @@ class LFCPNXPCIEPHY(LiteXModule):
             o_usr_lmmi_rdata_valid_o            = usr_lmmi.rdata_valid,
             o_usr_lmmi_ready_o                  = usr_lmmi.ready,
                 
+            # Configuration Space Register Interface (UCFG): Link 0 reads only (ID reader).
             i_ucfg_link_i                       = Constant(0, 1),
-            i_ucfg_valid_i                      = Constant(0, 1),
+            i_ucfg_valid_i                      = ucfg_id_reader.valid,
             i_ucfg_wr_rd_n_i                    = Constant(0, 1),
-            i_ucfg_addr_i                       = Constant(0, 10),
+            i_ucfg_addr_i                       = ucfg_id_reader.addr,
             i_ucfg_f_i                          = Constant(0, 3),
             i_ucfg_wr_be_i                      = Constant(0, 4),
             i_ucfg_wr_data_i                    = Constant(0, 32),
-            o_ucfg_rd_data_o                    = Open(32),
-            o_ucfg_rd_done_o                    = Open(2),
-            o_ucfg_ready_o                      = Open(),
+            o_ucfg_rd_data_o                    = ucfg_id_reader.rd_data,
+            o_ucfg_rd_done_o                    = ucfg_rd_done,
+            o_ucfg_ready_o                      = ucfg_id_reader.ready,
         )
 
         self.lmmi_ip_params.update(
