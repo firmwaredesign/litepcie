@@ -27,6 +27,7 @@ Current version of the generator is limited to:
 - Gowin GW5AT.
 - Lattice LFCPNX.
 - Lattice LFD2NX.
+- Lattice PCIe IP external to the core, connected at the TLP level (LATTICETLPPHY).
 """
 
 import yaml
@@ -49,12 +50,14 @@ from litex.soc.integration.builder  import *
 from litepcie.phy.c5pciephy     import C5PCIEPHY
 from litepcie.phy.lfcpnxpciephy import LFCPNXPCIEPHY
 from litepcie.phy.lfd2nxpciephy import LFD2NXPCIEPHY
+from litepcie.phy.latticetlpphy import LatticeTLPPHY
 from litepcie.phy.gw5apciephy   import GW5APCIEPHY
 from litepcie.phy.s7pciephy     import S7PCIEPHY
 from litepcie.phy.uspciephy     import USPCIEPHY
 from litepcie.phy.usppciephy    import USPPCIEPHY
 
 from litepcie.core import LitePCIeEndpoint, LitePCIeMSI, LitePCIeMSIMultiVector, LitePCIeMSIX
+from litepcie.core.msi import LitePCIeMSITLP
 
 from litepcie.frontend.dma      import LitePCIeDMA
 from litepcie.frontend.wishbone import LitePCIeWishboneMaster, LitePCIeWishboneSlave
@@ -139,6 +142,54 @@ def get_clkin_usr_ios():
     # of the PCIe refclk); minimum frequency depends on the target link speed
     # baked into the generated archive -- see litepcie/phy/lfd2nxpciephy.py.
     return [("clkin_usr", 0, Pins(1))]
+
+def get_pcie_ios_lattice_tlp(pcie_data_width=32):
+    # LatticeTLPPHY: the Lattice PCIe IP is instantiated in the User top level, next to the core.
+    # The core connects to the IP's TLP interface (vc_rx_*/vc_tx_*) and gets link/configuration-
+    # space status from User logic (ucfg reader) -- see litepcie/phy/latticetlpphy.py.
+    return [
+        ("pcie", 0,
+            # Clk/Rst / Link Status (clk: clock fed to the IP's clk_usr_i; u_*_link_up_o).
+            Subsignal("clk",                   Pins(1)),
+            Subsignal("rst_n",                 Pins(1)),
+            Subsignal("pl_link_up",            Pins(1)),
+            Subsignal("dl_link_up",            Pins(1)),
+            Subsignal("tl_link_up",            Pins(1)),
+
+            # TLP Receive Interface (IP vc_rx_*).
+            Subsignal("rx_valid",              Pins(1)),
+            Subsignal("rx_ready",              Pins(1)),
+            Subsignal("rx_sop",                Pins(1)),
+            Subsignal("rx_eop",                Pins(1)),
+            Subsignal("rx_data",               Pins(pcie_data_width)),
+            Subsignal("rx_credit_init",        Pins(1)),
+            Subsignal("rx_credit_nh",          Pins(12)),
+            Subsignal("rx_credit_nh_inf",      Pins(1)),
+            Subsignal("rx_credit_return",      Pins(1)),
+
+            # TLP Transmit Interface (IP vc_tx_*).
+            Subsignal("tx_valid",              Pins(1)),
+            Subsignal("tx_ready",              Pins(1)),
+            Subsignal("tx_sop",                Pins(1)),
+            Subsignal("tx_eop",                Pins(1)),
+            Subsignal("tx_eop_n",              Pins(1)),
+            Subsignal("tx_data",               Pins(pcie_data_width)),
+            Subsignal("tx_datap",              Pins(pcie_data_width//8)),
+
+            # Configuration-Space Status (from ucfg reader).
+            Subsignal("id",                    Pins(16)),
+            Subsignal("bus_master_enable",     Pins(1)),
+            Subsignal("max_payload_size",      Pins(3)),
+            Subsignal("max_read_request_size", Pins(3)),
+            Subsignal("link_speed",            Pins(4)),
+            Subsignal("link_width",            Pins(6)),
+            Subsignal("msi_enable",            Pins(1)),
+            Subsignal("msi_mme",               Pins(3)),
+            Subsignal("msi_address",           Pins(64)),
+            Subsignal("msi_data",              Pins(16)),
+            Subsignal("msi_mask",              Pins(32)),
+        ),
+    ]
 
 def get_axi_dma_ios(_id, data_width, with_writer=True, with_reader=True):
     ios = []
@@ -243,6 +294,8 @@ class LitePCIeCore(SoCMini):
         elif core_config["phy"] is LFD2NXPCIEPHY:
             platform.add_extension(get_pcie_ios_lattice_lfd2nx())
             platform.add_extension(get_clkin_usr_ios())
+        elif core_config["phy"] is LatticeTLPPHY:
+            platform.add_extension(get_pcie_ios_lattice_tlp(core_config["phy_pcie_data_width"]))
         else:
             platform.add_extension(get_pcie_ios(core_config["phy_lanes"]))
         platform.add_extension(get_msi_irqs_ios(width=core_config["msi_irqs"]))
@@ -456,7 +509,18 @@ class LitePCIeCore(SoCMini):
                 self.pcie_msi = LitePCIeMSIMultiVector(width=32)
             else:
                 self.pcie_msi = LitePCIeMSI(width=32)
-            self.comb += self.pcie_msi.source.connect(self.pcie_phy.msi)
+            # PHY without MSI request interface: send MSIs as Memory Write TLPs.
+            if hasattr(self.pcie_phy, "msi_address"):
+                self.pcie_msi_tlp = LitePCIeMSITLP(self.pcie_endpoint,
+                    enable  = self.pcie_phy.msi_enable,
+                    address = self.pcie_phy.msi_address,
+                    data    = self.pcie_phy.msi_data,
+                    mme     = self.pcie_phy.msi_mme,
+                    mask    = self.pcie_phy.msi_mask,
+                )
+                self.comb += self.pcie_msi.source.connect(self.pcie_msi_tlp.sink)
+            else:
+                self.comb += self.pcie_msi.source.connect(self.pcie_phy.msi)
             self.comb += self.pcie_msi.irqs[16:16+core_config["msi_irqs"]].eq(platform.request("msi_irqs"))
         self.interrupts = {}
         for i in range(len(dmas_params)):
@@ -607,6 +671,15 @@ def main():
             "LFD2NXPCIEPHY only supports phy_lanes: 1 (this IP is generated single-lane only)."
         core_config.setdefault("phy_pcie_data_width", 32)
         core_config["phy"] = LFD2NXPCIEPHY
+    elif core_config["phy"] == "LATTICETLPPHY":
+        from litex.build.lattice import LatticePlatform
+        platform = LatticePlatform(core_config["phy_device"], io=[], toolchain="radiant")
+        # The external IP owns the MSI capability (MSI-X disabled); MSIs are sent as TLPs.
+        core_config.setdefault("msi_x", False)
+        assert core_config.get("phy_lanes", 1) == 1, \
+            "LATTICETLPPHY only supports phy_lanes: 1 (32-bit TLP interface)."
+        core_config.setdefault("phy_pcie_data_width", 32)
+        core_config["phy"] = LatticeTLPPHY
     elif core_config["phy"] == "GW5APCIEPHY":
         from litex.build.gowin import GowinPlatform
         platform = GowinPlatform(core_config["phy_device"], io=[], toolchain="gowin")

@@ -125,7 +125,21 @@ class LitePCIeEndpoint(LiteXModule):
 
         # Master: FPGA initiates the transactions --------------------------------------------------
 
-        self.comb += [
-            crossbar.phy_master.source.connect(req_sink),
-            cmp_source.connect(crossbar.phy_master.sink),
-        ]
+        self.comb += cmp_source.connect(crossbar.phy_master.sink)
+
+        # PHYs providing the Command register's Bus Master Enable gate FPGA-initiated requests with
+        # it (a Function must not issue requests while it is cleared). A started request completes.
+        if hasattr(phy, "bus_master_enable"):
+            req_in_progress = Signal()
+            req_allowed     = Signal()
+            self.comb += [
+                req_allowed.eq(phy.bus_master_enable | req_in_progress),
+                crossbar.phy_master.source.connect(req_sink, omit={"valid", "ready"}),
+                req_sink.valid.eq(crossbar.phy_master.source.valid & req_allowed),
+                crossbar.phy_master.source.ready.eq(req_sink.ready & req_allowed),
+            ]
+            self.sync += If(req_sink.valid & req_sink.ready,
+                req_in_progress.eq(~req_sink.last)
+            )
+        else:
+            self.comb += crossbar.phy_master.source.connect(req_sink)
