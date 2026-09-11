@@ -146,6 +146,140 @@ class PHYRXDatapath(Module):
                 pipe_valid.source.connect(source),
             ]
 
+# TX/RX Padding (TLP interfaces without byte enables) ---------------------------------------------
+
+class PHYTXPaddingRemover(Module):
+    """Remove the padding DWORDs of down-converted TLPs.
+
+    Down-converting a TLP to DWORDs outputs the unused part of its last beat as DWORDs with be == 0.
+    TLP interfaces without byte enables (e.g. Lattice vc_tx_*) would send them as part of the TLP:
+    drop them and move last to the last real DWORD (one DWORD of latency).
+    """
+    def __init__(self, data_width=32):
+        self.sink   = sink   = stream.Endpoint(phy_layout(data_width))
+        self.source = source = stream.Endpoint(phy_layout(data_width))
+
+        # # #
+
+        held_valid = Signal()
+        held       = stream.Endpoint(phy_layout(data_width))
+        drop       = Signal()
+        self.comb += [
+            drop.eq(sink.valid & (sink.be == 0)),
+            source.valid.eq(held_valid & (held.last | (sink.valid & (~drop | sink.last)))),
+            source.first.eq(held.first),
+            source.last.eq(held.last | (drop & sink.last)),
+            source.dat.eq(held.dat),
+            source.be.eq(held.be),
+            If(drop & ~sink.last,
+                sink.ready.eq(1),
+            ).Else(
+                sink.ready.eq(~held_valid | source.ready),
+            )
+        ]
+        self.sync += [
+            If(source.valid & source.ready,
+                held_valid.eq(0)
+            ),
+            If(sink.valid & sink.ready & ~drop,
+                held_valid.eq(1),
+                held.first.eq(sink.first),
+                held.last.eq(sink.last),
+                held.dat.eq(sink.dat),
+                held.be.eq(sink.be),
+            )
+        ]
+
+class PHYRXTLPTrimmer(Module):
+    """Trim received TLPs to the DWORD count given by their header.
+
+    For DWORD interfaces with TLP byte 0 on bits 7:0 (e.g. Lattice vc_rx_*). The Lattice PCIe IP user
+    guides describe a trash DWORD appended to TLPs on the receive interface (not seen with the single-
+    lane LFD2NX IP); DWORDs after the header + payload length (including an ECRC, unused by LitePCIe)
+    are dropped and last is moved to the last TLP DWORD. dropped pulses for each dropped DWORD.
+    """
+    def __init__(self, data_width=32):
+        assert data_width == 32
+        self.sink    = sink   = stream.Endpoint(phy_layout(data_width))
+        self.source  = source = stream.Endpoint(phy_layout(data_width))
+        self.dropped = Signal()
+
+        # # #
+
+        fmt           = sink.dat[5:8]
+        length        = Cat(sink.dat[24:32], sink.dat[16:18]) # TLP byte 3 + byte 2 bits 1:0.
+        header_dwords = Signal(3)
+        data_dwords   = Signal(11)
+        self.comb += [
+            header_dwords.eq(Mux(fmt[0], 4, 3)),
+            data_dwords.eq(Mux(fmt[1], Mux(length == 0, 1024, length), 0)),
+        ]
+
+        remaining = Signal(11)  # DWORDs left in the current TLP after the current one.
+        dropping  = Signal()    # Dropping DWORDs until the IP's end of packet.
+        current_remaining = Signal(11)
+        self.comb += [
+            If(sink.first,
+                current_remaining.eq(header_dwords + data_dwords - 1)
+            ).Else(
+                current_remaining.eq(remaining)
+            ),
+            If(dropping & ~sink.first,
+                sink.ready.eq(1),
+                self.dropped.eq(sink.valid),
+            ).Else(
+                sink.connect(source, omit={"last"}),
+                source.last.eq(sink.last | (current_remaining == 0)),
+            )
+        ]
+        self.sync += If(sink.valid & sink.ready,
+            If(dropping & ~sink.first,
+                If(sink.last, dropping.eq(0))
+            ).Else(
+                remaining.eq(current_remaining - 1),
+                dropping.eq((current_remaining == 0) & ~sink.last),
+            )
+        )
+
+class PHYRXPaddingInserter(Module):
+    """Pad TLPs to a multiple of ratio DWORDs before up-conversion.
+
+    TLP interfaces without byte enables (e.g. Lattice vc_rx_*) mark all DWORDs valid; when a TLP ends
+    before the end of a beat, up-conversion would otherwise fill the rest of the beat with stale
+    data and byte enables. Append DWORDs with be == 0 instead.
+    """
+    def __init__(self, data_width=32, ratio=2):
+        self.sink   = sink   = stream.Endpoint(phy_layout(data_width))
+        self.source = source = stream.Endpoint(phy_layout(data_width))
+
+        # # #
+
+        count     = Signal(max=max(ratio, 2))
+        last_word = Signal()
+        pad       = Signal()
+        self.comb += [
+            last_word.eq(count == (ratio - 1)),
+            If(pad,
+                source.valid.eq(1),
+                source.last.eq(last_word),
+            ).Else(
+                sink.connect(source, omit={"last"}),
+                source.last.eq(sink.last & last_word),
+            )
+        ]
+        self.sync += If(source.valid & source.ready,
+            If(last_word,
+                count.eq(0),
+            ).Else(
+                count.eq(count + 1),
+            ),
+            If(pad,
+                If(last_word, pad.eq(0))
+            ).Elif(sink.last & ~last_word,
+                pad.eq(1)
+            )
+        )
+
 # LTSSMTracer --------------------------------------------------------------------------------------
 
 class LTSSMTracer(Module, AutoCSR):
