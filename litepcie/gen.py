@@ -232,6 +232,78 @@ def get_msi_irqs_ios(width=16):
     return [("msi_irqs", 0, Pins(width))]
 
 
+def get_eth_ios(dw=8):
+    # PHY-side stream of the Ethernet MAC, handed to the User's module: eth_tx_* is driven by the
+    # core (Host --> User), eth_rx_* by the User (User --> Host). Ethernet frames are carried without
+    # preamble/FCS unless ethernet_preamble_crc is set.
+    def stream_ios(name):
+        return (name, 0,
+            Subsignal("valid",   Pins(1)),
+            Subsignal("ready",   Pins(1)),
+            Subsignal("first",   Pins(1)),
+            Subsignal("last",    Pins(1)),
+            Subsignal("data",    Pins(dw)),
+            Subsignal("last_be", Pins(dw//8)),
+            Subsignal("error",   Pins(dw//8)),
+        )
+    return [stream_ios("eth_tx"), stream_ios("eth_rx")]
+
+# Ethernet User PHY --------------------------------------------------------------------------------
+
+class UserEthPHY(LiteXModule):
+    """Ethernet "PHY" handing the MAC's PHY-side stream to the User instead of driving a real PHY.
+
+    The User connects a custom module to the eth_tx_*/eth_rx_* IOs and exchanges Ethernet frames with
+    the Host, which sees a standard LiteEth MAC (handled by the LitePCIe driver's network interface).
+    With with_loopback, the stream is looped back inside the core instead (bring-up/test).
+    """
+    def __init__(self, platform, dw=8, with_preamble_crc=False, with_padding=False, with_loopback=False):
+        from liteeth.common import eth_phy_description
+        self.dw                = dw
+        self.with_preamble_crc = with_preamble_crc
+        self.with_padding      = with_padding
+        self.sink   = sink   = stream.Endpoint(eth_phy_description(dw)) # MAC  --> User (TX).
+        self.source = source = stream.Endpoint(eth_phy_description(dw)) # User --> MAC  (RX).
+
+        # # #
+
+        # The MAC's PHY-side datapath runs in the eth_tx/eth_rx clock domains: use the core's Clk.
+        self.cd_eth_tx = ClockDomain()
+        self.cd_eth_rx = ClockDomain()
+        self.comb += [
+            self.cd_eth_tx.clk.eq(ClockSignal("sys")),
+            self.cd_eth_tx.rst.eq(ResetSignal("sys")),
+            self.cd_eth_rx.clk.eq(ClockSignal("sys")),
+            self.cd_eth_rx.rst.eq(ResetSignal("sys")),
+        ]
+
+        # Loopback (TX --> RX) or User IOs.
+        if with_loopback:
+            self.comb += sink.connect(source)
+        else:
+            platform.add_extension(get_eth_ios(dw))
+            tx_pads = platform.request("eth_tx")
+            rx_pads = platform.request("eth_rx")
+            self.comb += [
+                # MAC --> User.
+                tx_pads.valid.eq(sink.valid),
+                sink.ready.eq(tx_pads.ready),
+                tx_pads.first.eq(sink.first),
+                tx_pads.last.eq(sink.last),
+                tx_pads.data.eq(sink.data),
+                tx_pads.last_be.eq(sink.last_be),
+                tx_pads.error.eq(sink.error),
+
+                # User --> MAC.
+                source.valid.eq(rx_pads.valid),
+                rx_pads.ready.eq(source.ready),
+                source.first.eq(rx_pads.first),
+                source.last.eq(rx_pads.last),
+                source.data.eq(rx_pads.data),
+                source.last_be.eq(rx_pads.last_be),
+                source.error.eq(rx_pads.error),
+            ]
+
 def get_ptm_ios(phy_lanes=4):
     return [
         ("ptm", 0,
@@ -497,6 +569,59 @@ class LitePCIeCore(SoCMini):
                     dma_reader_ios.tuser.eq(pcie_dma.source.first),
                 ]
 
+        # Ethernet ---------------------------------------------------------------------------------
+        # LiteEth MAC with its slots mapped in BAR0: the Host sees a standard LiteEth MAC (handled by
+        # the LitePCIe driver's network interface) and the User exchanges Ethernet frames on the
+        # PHY-side stream (see UserEthPHY).
+        if core_config.get("ethernet", False):
+            from liteeth.mac import LiteEthMAC
+            eth_data_width = core_config.get("ethernet_data_width", 32)
+            assert eth_data_width == 32, "ethernet_data_width must be 32 (BAR0/Wishbone data width)."
+            eth_nrxslots = core_config.get("ethernet_rx_slots", 2)
+            eth_ntxslots = core_config.get("ethernet_tx_slots", 2)
+
+            self.eth_phy = eth_phy = UserEthPHY(platform,
+                dw                = core_config.get("ethernet_phy_data_width", 8),
+                with_preamble_crc = core_config.get("ethernet_preamble_crc",   False),
+                with_padding      = core_config.get("ethernet_padding",        False),
+                with_loopback     = core_config.get("ethernet_loopback",       False),
+            )
+            self.ethmac = ethmac = LiteEthMAC(
+                phy        = eth_phy,
+                dw         = eth_data_width,
+                interface  = "wishbone",
+                endianness = "big",
+                # The Host only reads the RX slots and only writes the TX slots (and so does the
+                # driver), so each slot memory keeps a single writer. Making the RX slots writable
+                # from the Host adds a second, byte-granular write process on the same memory, which
+                # Synplify Pro (Radiant) rejects with:
+                #   @E: CS152 |Only one always block can assign given variable mac_sram_writer_slot0
+                nrxslots   = eth_nrxslots, rxslots_read_only  = True,
+                ntxslots   = eth_ntxslots, txslots_write_only = False,
+            )
+
+            # Map the MAC's RX/TX slots in BAR0, after the CSR region.
+            eth_slot_size = ethmac.slot_size.constant
+            eth_rx_size   = eth_nrxslots*eth_slot_size
+            eth_tx_size   = eth_ntxslots*eth_slot_size
+            eth_origin    = core_config.get("ethernet_base", 0x10000)
+            self.bus.add_region("ethmac", SoCRegion(
+                origin = eth_origin,
+                size   = eth_rx_size + eth_tx_size,
+                linker = True,
+                cached = False,
+            ))
+            self.bus.add_slave(name="ethmac_rx", slave=ethmac.bus_rx, region=SoCRegion(
+                origin = eth_origin,
+                size   = eth_rx_size,
+                cached = False,
+            ))
+            self.bus.add_slave(name="ethmac_tx", slave=ethmac.bus_tx, region=SoCRegion(
+                origin = eth_origin + eth_rx_size,
+                size   = eth_tx_size,
+                cached = False,
+            ))
+
         # PCIe MSI ---------------------------------------------------------------------------------
         if core_config.get("msi_x", False):
             assert core_config["msi_irqs"] <= 32
@@ -523,6 +648,8 @@ class LitePCIeCore(SoCMini):
                 self.comb += self.pcie_msi.source.connect(self.pcie_phy.msi)
             self.comb += self.pcie_msi.irqs[16:16+core_config["msi_irqs"]].eq(platform.request("msi_irqs"))
         self.interrupts = {}
+        if core_config.get("ethernet", False):
+            self.interrupts["ethmac"] = self.ethmac.ev.irq
         for i in range(len(dmas_params)):
             pcie_dma = getattr(self, f"pcie_dma{i}")
             if hasattr(pcie_dma, "writer"):

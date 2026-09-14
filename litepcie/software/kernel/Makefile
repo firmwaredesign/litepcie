@@ -13,7 +13,7 @@ all: litepcie.ko liteuart.ko
 litepcie.ko: main.c
 	make -C $(KERNEL_PATH) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) M=$(shell pwd) modules
 
-litepcie.ko: litepcie.h config.h flags.h csr.h soc.h
+litepcie.ko: litepcie.h config.h flags.h csr.h soc.h mem.h
 
 liteuart.ko: liteuart.c
 	make -C $(KERNEL_PATH) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) M=$(shell pwd) modules

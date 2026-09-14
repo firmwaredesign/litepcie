@@ -35,6 +35,8 @@
 #include <linux/idr.h>
 #include <linux/rwsem.h>
 #include <linux/platform_device.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
 #include <linux/version.h>
 #include <linux/dma-mapping.h>
 
@@ -47,6 +49,18 @@
 #include "config.h"
 #include "flags.h"
 #include "soc.h"
+#include "mem.h"
+
+/* Ethernet: when the gateware has an Ethernet MAC (ethernet enabled in the core's configuration),
+ * its RX/TX slots (ETHMAC_RX_BASE/ETHMAC_TX_BASE in BAR0) and its registers are accessible to the
+ * Host and the driver registers a network interface for it. Define LITEPCIE_NO_ETHERNET to build
+ * without it.
+ */
+#if defined(CSR_ETHMAC_BASE) && !defined(LITEPCIE_NO_ETHERNET)
+#define LITEPCIE_ETHERNET
+struct litepcie_device;
+static void liteeth_interrupt(struct litepcie_device *s);
+#endif
 
 //#define DEBUG_CSR
 //#define DEBUG_MSI
@@ -112,6 +126,9 @@ struct litepcie_device {
 	struct kref ref;                              /* Allocation lifetime */
 	struct rw_semaphore hw_lock;                  /* Hardware access gate */
 	bool disconnected;                            /* Guarded by hw_lock */
+#ifdef LITEPCIE_ETHERNET
+	struct net_device *netdev;                    /* Ethernet MAC network interface */
+#endif
 };
 
 struct litepcie_chan_priv {
@@ -410,6 +427,14 @@ static irqreturn_t litepcie_interrupt(int irq, void *data)
 	irq_vector &= irq_enable;
 	clear_mask = 0;
 
+#ifdef LITEPCIE_ETHERNET
+	/* Ethernet MAC interrupt handling */
+	if (irq_vector & (1 << ETHMAC_INTERRUPT)) {
+		liteeth_interrupt(s);
+		clear_mask |= (1 << ETHMAC_INTERRUPT);
+	}
+#endif
+
 	for (i = 0; i < s->channels; i++) {
 		chan = &s->chan[i];
 		/* dma reader interrupt handling */
@@ -452,6 +477,222 @@ static irqreturn_t litepcie_interrupt(int irq, void *data)
 
 	return IRQ_HANDLED;
 }
+
+#ifdef LITEPCIE_ETHERNET
+
+/* -----------------------------------------------------------------------------------------------*/
+/*                                    Ethernet / NetDev                                            */
+/* -----------------------------------------------------------------------------------------------*/
+
+/* The gateware's LiteEth MAC exposes its RX/TX slots in BAR0 (ETHMAC_RX_BASE/ETHMAC_TX_BASE), one
+ * Ethernet frame per slot, and its registers as CSRs. Frames are copied to/from the slots and the
+ * MAC's IRQ (ETHMAC_INTERRUPT, shared with the DMAs through the MSI vector) reports received frames
+ * and completed transmissions.
+ */
+
+struct liteeth_device {
+	struct net_device      *netdev;
+	struct litepcie_device *litepcie_dev;
+	void __iomem           *rx_base;  /* RX slots in BAR0 */
+	void __iomem           *tx_base;  /* TX slots in BAR0 */
+	uint32_t                slot_size;
+	uint32_t                num_rx_slots;
+	uint32_t                num_tx_slots;
+	uint32_t                tx_slot;
+};
+
+/* Receive the frames the MAC has written to its RX slots. Called from the interrupt handler. */
+static void liteeth_rx(struct net_device *netdev)
+{
+	struct liteeth_device  *priv = netdev_priv(netdev);
+	struct litepcie_device *s    = priv->litepcie_dev;
+	struct sk_buff *skb;
+	uint32_t rx_slot, len;
+
+	while (litepcie_readl(s, CSR_ETHMAC_SRAM_WRITER_EV_PENDING_ADDR)) {
+		rx_slot = litepcie_readl(s, CSR_ETHMAC_SRAM_WRITER_SLOT_ADDR) % priv->num_rx_slots;
+		len     = litepcie_readl(s, CSR_ETHMAC_SRAM_WRITER_LENGTH_ADDR);
+
+		if (len == 0 || len > priv->slot_size) {
+			netdev->stats.rx_length_errors++;
+			netdev->stats.rx_errors++;
+			goto next;
+		}
+
+		skb = netdev_alloc_skb_ip_align(netdev, len);
+		if (!skb) {
+			netdev->stats.rx_dropped++;
+			goto next;
+		}
+
+		memcpy_fromio(skb_put(skb, len), priv->rx_base + rx_slot*priv->slot_size, len);
+		skb->protocol = eth_type_trans(skb, netdev);
+		netdev->stats.rx_packets++;
+		netdev->stats.rx_bytes += len;
+		netif_rx(skb);
+next:
+		/* Release the slot: the MAC can use it for the next frame. */
+		litepcie_writel(s, CSR_ETHMAC_SRAM_WRITER_EV_PENDING_ADDR, 1);
+	}
+}
+
+/* Ethernet part of the MSI interrupt handler. */
+static void liteeth_interrupt(struct litepcie_device *s)
+{
+	struct net_device *netdev = s->netdev;
+
+	if (!netdev)
+		return;
+
+	/* Transmission done: the MAC can accept a new frame. */
+	if (litepcie_readl(s, CSR_ETHMAC_SRAM_READER_EV_PENDING_ADDR)) {
+		litepcie_writel(s, CSR_ETHMAC_SRAM_READER_EV_PENDING_ADDR, 1);
+		if (netif_queue_stopped(netdev))
+			netif_wake_queue(netdev);
+	}
+
+	/* Frame(s) received. */
+	liteeth_rx(netdev);
+}
+
+static int liteeth_open(struct net_device *netdev)
+{
+	struct liteeth_device  *priv = netdev_priv(netdev);
+	struct litepcie_device *s    = priv->litepcie_dev;
+
+	/* Clear the pending events of both directions. */
+	litepcie_writel(s, CSR_ETHMAC_SRAM_WRITER_EV_PENDING_ADDR, 1);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_READER_EV_PENDING_ADDR, 1);
+
+	/* Enable them, in the MAC and in the MSI vector. */
+	litepcie_writel(s, CSR_ETHMAC_SRAM_WRITER_EV_ENABLE_ADDR, 1);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_READER_EV_ENABLE_ADDR, 1);
+	litepcie_enable_interrupt(s, ETHMAC_INTERRUPT);
+
+	priv->tx_slot = 0;
+
+	netif_carrier_on(netdev);
+	netif_start_queue(netdev);
+
+	return 0;
+}
+
+static int liteeth_stop(struct net_device *netdev)
+{
+	struct liteeth_device  *priv = netdev_priv(netdev);
+	struct litepcie_device *s    = priv->litepcie_dev;
+
+	netif_stop_queue(netdev);
+	netif_carrier_off(netdev);
+
+	litepcie_disable_interrupt(s, ETHMAC_INTERRUPT);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_WRITER_EV_ENABLE_ADDR, 0);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_READER_EV_ENABLE_ADDR, 0);
+
+	return 0;
+}
+
+static netdev_tx_t liteeth_start_xmit(struct sk_buff *skb, struct net_device *netdev)
+{
+	struct liteeth_device  *priv = netdev_priv(netdev);
+	struct litepcie_device *s    = priv->litepcie_dev;
+
+	/* No free TX slot: stop the queue, the TX IRQ wakes it up again. */
+	if (!litepcie_readl(s, CSR_ETHMAC_SRAM_READER_READY_ADDR)) {
+		netif_stop_queue(netdev);
+		return NETDEV_TX_BUSY;
+	}
+
+	if (unlikely(skb->len > priv->slot_size)) {
+		netdev->stats.tx_dropped++;
+		netdev->stats.tx_errors++;
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
+
+	memcpy_toio(priv->tx_base + priv->tx_slot*priv->slot_size, skb->data, skb->len);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_READER_SLOT_ADDR,   priv->tx_slot);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_READER_LENGTH_ADDR, skb->len);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_READER_START_ADDR,  1);
+
+	netdev->stats.tx_packets++;
+	netdev->stats.tx_bytes += skb->len;
+
+	priv->tx_slot = (priv->tx_slot + 1) % priv->num_tx_slots;
+	dev_kfree_skb_any(skb);
+
+	return NETDEV_TX_OK;
+}
+
+static const struct net_device_ops liteeth_netdev_ops = {
+	.ndo_open       = liteeth_open,
+	.ndo_stop       = liteeth_stop,
+	.ndo_start_xmit = liteeth_start_xmit,
+	.ndo_set_mac_address = eth_mac_addr,
+	.ndo_validate_addr   = eth_validate_addr,
+};
+
+/* Register the network interface of the gateware's Ethernet MAC. */
+static int liteeth_init(struct litepcie_device *s)
+{
+	struct net_device     *netdev;
+	struct liteeth_device *priv;
+	int ret;
+
+	netdev = devm_alloc_etherdev(&s->dev->dev, sizeof(*priv));
+	if (!netdev)
+		return -ENOMEM;
+
+	SET_NETDEV_DEV(netdev, &s->dev->dev);
+
+	priv               = netdev_priv(netdev);
+	priv->netdev       = netdev;
+	priv->litepcie_dev = s;
+	priv->slot_size    = ETHMAC_SLOT_SIZE;
+	priv->num_rx_slots = ETHMAC_RX_SLOTS;
+	priv->num_tx_slots = ETHMAC_TX_SLOTS;
+	priv->rx_base      = s->bar0_addr + ETHMAC_RX_BASE;
+	priv->tx_base      = s->bar0_addr + ETHMAC_TX_BASE;
+
+	/* The gateware has no MAC address of its own: use a random one. */
+	eth_hw_addr_random(netdev);
+
+	netdev->netdev_ops = &liteeth_netdev_ops;
+	netdev->mtu        = ETH_DATA_LEN;
+	strscpy(netdev->name, "liteeth%d", IFNAMSIZ);
+
+	/* The MAC is idle until the interface is brought up. */
+	litepcie_writel(s, CSR_ETHMAC_SRAM_WRITER_EV_ENABLE_ADDR, 0);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_READER_EV_ENABLE_ADDR, 0);
+
+	ret = register_netdev(netdev);
+	if (ret) {
+		dev_err(&s->dev->dev, "Failed to register netdev %d\n", ret);
+		return ret;
+	}
+
+	s->netdev = netdev;
+
+	netdev_info(netdev, "LiteEth MAC: irq %d, slots: rx %d tx %d, size %d\n",
+		ETHMAC_INTERRUPT, priv->num_rx_slots, priv->num_tx_slots, priv->slot_size);
+
+	return 0;
+}
+
+static void liteeth_deinit(struct litepcie_device *s)
+{
+	if (!s->netdev)
+		return;
+
+	litepcie_disable_interrupt(s, ETHMAC_INTERRUPT);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_WRITER_EV_ENABLE_ADDR, 0);
+	litepcie_writel(s, CSR_ETHMAC_SRAM_READER_EV_ENABLE_ADDR, 0);
+
+	unregister_netdev(s->netdev);
+	s->netdev = NULL;
+}
+
+#endif /* LITEPCIE_ETHERNET */
 
 static int litepcie_open(struct inode *inode, struct file *file)
 {
@@ -1278,6 +1519,13 @@ static int litepcie_pci_probe(struct pci_dev *dev, const struct pci_device_id *i
 
 	litepcie_dev->channels = DMA_CHANNELS;
 
+#ifdef LITEPCIE_ETHERNET
+	/* Register the network interface of the gateware's Ethernet MAC */
+	ret = liteeth_init(litepcie_dev);
+	if (ret < 0)
+		goto fail2;
+#endif
+
 	ret = litepcie_reserve_minors(litepcie_dev);
 	if (ret < 0) {
 		dev_err(&dev->dev, "Failed to allocate a minor range\n");
@@ -1442,6 +1690,11 @@ static void litepcie_pci_remove(struct pci_dev *dev)
 		if (litepcie_dev->chan[i].mapping)
 			unmap_mapping_range(litepcie_dev->chan[i].mapping, 0, 0, 1);
 	}
+
+#ifdef LITEPCIE_ETHERNET
+	/* Unregister the network interface before the hardware goes away */
+	liteeth_deinit(litepcie_dev);
+#endif
 
 	/* Stop the DMAs */
 	litepcie_stop_dma(litepcie_dev);

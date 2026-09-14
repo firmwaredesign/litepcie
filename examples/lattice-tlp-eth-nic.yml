@@ -1,0 +1,59 @@
+#
+# This file is part of LitePCIe.
+#
+# Copyright (c) 2019-2024 Florent Kermarrec <florent@enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
+# lattice-tlp-nic.yml + an Ethernet MAC: the Host sees a network interface (LiteEth MAC slots mapped
+# in BAR0, handled by the LitePCIe driver) and the User connects a custom module exchanging Ethernet
+# frames on the eth_tx_*/eth_rx_* stream IOs.
+#
+# NOTE: ethernet_loopback loops the MAC's PHY-side stream inside the core (frames sent by the Host
+# come back to it) to test the network interface without the User's module: set it to False and
+# connect the module to the eth_tx_*/eth_rx_* IOs for the real thing.
+
+{
+    # PHY ----------------------------------------------------------------------
+    "phy"                     : "LATTICETLPPHY", # Type of PCIe PHY
+    "phy_device"              : "LFD2NX-40",     # Type of Device
+    "phy_pcie_data_width"     : 32,              # PCIe data_width (fixed, single-lane)
+    "phy_data_width"          : 64,              # Bus data_width
+    "phy_bar0_size"           : 0x40000,         # BAR0 size
+
+    # Clocking -----------------------------------------------------------------
+    "clk_freq"                : 125e6, # User Clk Freq (AXI MMAP/DMA)
+    "clk_external"            : False, # Use external User provided Clk
+
+    # Endpoint -----------------------------------------------------------------
+    "ep_max_pending_requests" : 8,
+    "ep_address_width"        : 32,
+
+    # Control ------------------------------------------------------------------
+    "ctrl"                    : False,
+
+    # MMAP Master --------------------------------------------------------------
+    "mmap"                    : False,
+
+    # MMAP Slave ---------------------------------------------------------------
+    "mmap_slave"              : False,
+
+    # DMA channels -------------------------------------------------------------
+    "dma_channels"            : 1,     # Number of DMA channels
+    "dma_buffering"           : 8192,  # Buffering for each channel (in bytes)
+    "dma_loopback"            : True,  # Enable DMA loopback capability (CSR layout expected by the kernel driver)
+    "dma_synchronizer"        : False, # Enable DMA synchronizer capability
+    "dma_monitor"             : False, # Enable DMA monitoring capability
+
+    # Ethernet -----------------------------------------------------------------
+    "ethernet"                : True,    # Add an Ethernet MAC (Host network interface).
+    "ethernet_base"           : 0x10000, # Base of the MAC slots in BAR0 (after the CSR region).
+    "ethernet_phy_data_width" : 8,       # Data width of the User's stream (eth_tx_*/eth_rx_*).
+    "ethernet_rx_slots"       : 2,       # Number of RX slots (one Ethernet frame each).
+    "ethernet_tx_slots"       : 2,       # Number of TX slots (one Ethernet frame each).
+    "ethernet_preamble_crc"   : False,   # Handle Preamble/FCS in the MAC (not in the User's module).
+    "ethernet_padding"        : False,   # Handle Padding in the MAC (not in the User's module).
+    "ethernet_loopback"       : True,    # Loop the User's stream inside the core (test, see NOTE).
+
+    # MSI IRQs -----------------------------------------------------------------
+    "msi_irqs"                : 4, # Number or MSI IRQs
+}
