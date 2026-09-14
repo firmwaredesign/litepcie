@@ -52,7 +52,7 @@
     "ethernet_tx_slots"       : 2,       # Number of TX slots (one Ethernet frame each).
     "ethernet_preamble_crc"   : False,   # Handle Preamble/FCS in the MAC (not in the User's module).
     "ethernet_padding"        : False,   # Handle Padding in the MAC (not in the User's module).
-    "ethernet_loopback"       : True,    # Loop the User's stream inside the core (test, see NOTE).
+    "ethernet_loopback"       : False,   # Loop the User's stream inside the core (test, see NOTE).
 
     # MSI IRQs -----------------------------------------------------------------
     "msi_irqs"                : 4, # Number or MSI IRQs

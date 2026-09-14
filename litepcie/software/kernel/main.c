@@ -632,6 +632,11 @@ static const struct net_device_ops liteeth_netdev_ops = {
 	.ndo_validate_addr   = eth_validate_addr,
 };
 
+/* MAC address reserved from the vendor's own IEEE OUI range for this core. Every instance carries
+ * the same address on purpose: a core only ever sits in a closed cabinet with a single device, and
+ * each cabinet is a separate Ethernet segment. */
+static const u8 liteeth_mac_addr[ETH_ALEN] = {0x0c, 0xef, 0xaf, 0x60, 0x11, 0x01};
+
 /* Register the network interface of the gateware's Ethernet MAC. */
 static int liteeth_init(struct litepcie_device *s)
 {
@@ -654,8 +659,11 @@ static int liteeth_init(struct litepcie_device *s)
 	priv->rx_base      = s->bar0_addr + ETHMAC_RX_BASE;
 	priv->tx_base      = s->bar0_addr + ETHMAC_TX_BASE;
 
-	/* The gateware has no MAC address of its own: use a random one. */
-	eth_hw_addr_random(netdev);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+	memcpy(netdev->dev_addr, liteeth_mac_addr, ETH_ALEN);
+#else
+	eth_hw_addr_set(netdev, liteeth_mac_addr);
+#endif
 
 	netdev->netdev_ops = &liteeth_netdev_ops;
 	netdev->mtu        = ETH_DATA_LEN;
