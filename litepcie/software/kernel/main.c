@@ -544,11 +544,12 @@ static void liteeth_interrupt(struct litepcie_device *s)
 	if (!netdev)
 		return;
 
-	/* Transmission done: the MAC can accept a new frame. */
+	/* Transmission done: the MAC can accept a new frame. Wake unconditionally -- testing
+	 * netif_queue_stopped() first loses the wakeup for a queue that liteeth_start_xmit() is
+	 * about to stop, which is the whole race the re-check there also guards against. */
 	if (litepcie_readl(s, CSR_ETHMAC_SRAM_READER_EV_PENDING_ADDR)) {
 		litepcie_writel(s, CSR_ETHMAC_SRAM_READER_EV_PENDING_ADDR, 1);
-		if (netif_queue_stopped(netdev))
-			netif_wake_queue(netdev);
+		netif_wake_queue(netdev);
 	}
 
 	/* Frame(s) received. */
@@ -600,6 +601,10 @@ static netdev_tx_t liteeth_start_xmit(struct sk_buff *skb, struct net_device *ne
 	/* No free TX slot: stop the queue, the TX IRQ wakes it up again. */
 	if (!litepcie_readl(s, CSR_ETHMAC_SRAM_READER_READY_ADDR)) {
 		netif_stop_queue(netdev);
+		/* The MAC can drain between the read above and the stop, in which case the TX IRQ has
+		 * already been and gone and nothing would ever wake the queue again. Re-check. */
+		if (litepcie_readl(s, CSR_ETHMAC_SRAM_READER_READY_ADDR))
+			netif_wake_queue(netdev);
 		return NETDEV_TX_BUSY;
 	}
 
@@ -624,10 +629,48 @@ static netdev_tx_t liteeth_start_xmit(struct sk_buff *skb, struct net_device *ne
 	return NETDEV_TX_OK;
 }
 
+/* The kernel only arms the netdev watchdog when this op exists, so without it a TX queue left
+ * stopped would hang silently forever. A User module holding eth_tx_ready low is legitimate
+ * backpressure and not an error, so only complain when the MAC is idle and the queue was left
+ * stopped regardless -- that combination is a driver bug, not a slow link. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
+static void liteeth_tx_timeout(struct net_device *netdev)
+#else
+static void liteeth_tx_timeout(struct net_device *netdev, unsigned int txqueue)
+#endif
+{
+	struct liteeth_device  *priv = netdev_priv(netdev);
+	struct litepcie_device *s    = priv->litepcie_dev;
+
+	if (!litepcie_readl(s, CSR_ETHMAC_SRAM_READER_READY_ADDR)) {
+		netdev_dbg(netdev, "TX still busy (FIFO level %u): User module is backpressuring\n",
+			litepcie_readl(s, CSR_ETHMAC_SRAM_READER_LEVEL_ADDR));
+		return;
+	}
+
+	netdev_warn(netdev, "TX queue stopped while the MAC is ready, waking it\n");
+	netdev->stats.tx_errors++;
+	netif_wake_queue(netdev);
+}
+
+/* The MAC drops frames it cannot store because both RX slots are still owned by the Host, and
+ * counts them in hardware. Surface that counter so "ip -s link" shows the loss instead of it
+ * being invisible: nothing in the RX path backpressures the User's module. */
+static void liteeth_get_stats64(struct net_device *netdev, struct rtnl_link_stats64 *stats)
+{
+	struct liteeth_device  *priv = netdev_priv(netdev);
+	struct litepcie_device *s    = priv->litepcie_dev;
+
+	netdev_stats_to_stats64(stats, &netdev->stats);
+	stats->rx_missed_errors = litepcie_readl(s, CSR_ETHMAC_SRAM_WRITER_ERRORS_ADDR);
+}
+
 static const struct net_device_ops liteeth_netdev_ops = {
 	.ndo_open       = liteeth_open,
 	.ndo_stop       = liteeth_stop,
 	.ndo_start_xmit = liteeth_start_xmit,
+	.ndo_tx_timeout = liteeth_tx_timeout,
+	.ndo_get_stats64     = liteeth_get_stats64,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr   = eth_validate_addr,
 };
@@ -667,6 +710,9 @@ static int liteeth_init(struct litepcie_device *s)
 
 	netdev->netdev_ops = &liteeth_netdev_ops;
 	netdev->mtu        = ETH_DATA_LEN;
+	/* Generous on purpose: the User's module may legitimately backpressure TX for a long time on
+	 * a slow link, and liteeth_tx_timeout() only reports an error if the MAC is idle anyway. */
+	netdev->watchdog_timeo = 10 * HZ;
 	strscpy(netdev->name, "liteeth%d", IFNAMSIZ);
 
 	/* The MAC is idle until the interface is brought up. */
