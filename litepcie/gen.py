@@ -590,7 +590,13 @@ class LitePCIeCore(SoCMini):
                 phy        = eth_phy,
                 dw         = eth_data_width,
                 interface  = "wishbone",
-                endianness = "big",
+                # The Host is little-endian and the driver moves frames in/out of the slots with
+                # memcpy_to/fromio (byte order = memory order), so the MAC must not reorder the bytes
+                # within a 32-bit word. With "big" the reversal cancels out in loopback for frames
+                # whose length is a multiple of 4, but the last partial word is emitted from the
+                # wrong byte lanes (a 1514-byte frame comes back with its last 2 bytes replaced by
+                # padding).
+                endianness = core_config.get("ethernet_endianness", "little"),
                 # The Host only reads the RX slots and only writes the TX slots (and so does the
                 # driver), so each slot memory keeps a single writer. Making the RX slots writable
                 # from the Host adds a second, byte-granular write process on the same memory, which

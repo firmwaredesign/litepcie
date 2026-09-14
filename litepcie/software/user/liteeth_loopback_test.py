@@ -37,7 +37,10 @@ def main():
     parser.add_argument("interface",  nargs="?", default="liteeth0", help="Network interface (default: liteeth0).")
     parser.add_argument("--count",    default=32,  type=int,   help="Number of frames per size (default: 32).")
     parser.add_argument("--timeout",  default=1.0, type=float, help="Receive timeout in seconds (default: 1.0).")
-    parser.add_argument("--sizes",    default="60,64,128,512,1024,1514", help="Frame sizes in bytes.")
+    # Sizes that are not a multiple of the 32-bit slot word are the interesting ones: they exercise
+    # the last partial word of the 8<->32-bit conversion (byte lanes/endianness), which a loopback
+    # test cannot catch on aligned frames because a symmetric byte swap cancels itself out.
+    parser.add_argument("--sizes",    default="60,61,62,63,64,128,512,1024,1512,1513,1514", help="Frame sizes in bytes.")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
